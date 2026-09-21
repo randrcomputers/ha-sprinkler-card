@@ -10,6 +10,8 @@ Same card chrome as the other Plus cards: title, status badge, tiles, and 100 / 
 
 Works with zone **switches**, **valves**, or toggles. Optional rain-delay switch. **Manual**, **Delay**, **Program**, and **Zones** start folded.
 
+<img width="490" height="583" alt="image" src="https://github.com/user-attachments/assets/4c04b0ff-762f-4aa7-b0f4-c52feba7ca5a" />
+
 ![Sprinkler card folded](media/collapsed.png)
 
 ![Sprinkler card while zone 7 is running](media/running.png)
