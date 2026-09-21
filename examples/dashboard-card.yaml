@@ -1,0 +1,29 @@
+# Sprinkler Plus — example Lovelace card
+#
+# size: 100 | 75 | 50
+# durations are minutes, in the same order as zones.
+# A zone object can override the name, minutes, and remaining sensor.
+
+type: custom:sprinkler-plus-card
+name: Sprinklers
+size: 100
+default_duration: 15
+durations: "15, 10, 20, 12"
+zones:
+  - switch.front_lawn
+  - switch.side_yard
+  - switch.west_lawn
+  - switch.back_beds
+rain_delay_entity: switch.sprinkler_rain_delay
+show_actions: true
+
+# Per-zone names and a remaining-time sensor:
+#
+# zones:
+#   - entity: switch.front_lawn
+#     name: Front Lawn
+#     duration: 15
+#   - entity: valve.west_lawn
+#     name: West Lawn
+#     duration: 20
+#     remaining_entity: sensor.west_lawn_remaining
