@@ -218,6 +218,76 @@
     }
   }
 
+  const CYCLE_GAP_MS = 3 * 60 * 1000;
+
+  function cycleStoreKey(ids) {
+    return `sprinkler-plus-card:cycle:${ids}`;
+  }
+
+  function loadCycle(ids) {
+    try {
+      const saved = JSON.parse(localStorage.getItem(cycleStoreKey(ids)) || "null");
+      if (!saved || !Number.isFinite(saved.started) || !Number.isFinite(saved.lastOn)) return null;
+      if (Date.now() - saved.lastOn > CYCLE_GAP_MS) return null;
+      const idsOf = (list) => (Array.isArray(list) ? list.filter((id) => typeof id === "string") : []);
+      return {
+        started: saved.started,
+        lastOn: saved.lastOn,
+        floor: Number(saved.floor) || 0,
+        program: String(saved.program || ""),
+        done: idsOf(saved.done),
+        seen: idsOf(saved.seen),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function saveCycle(ids, cycle) {
+    try {
+      localStorage.setItem(cycleStoreKey(ids), JSON.stringify(cycle));
+    } catch {
+      /* private mode */
+    }
+  }
+
+  function clearCycleStore(ids) {
+    try {
+      localStorage.removeItem(cycleStoreKey(ids));
+    } catch {
+      /* private mode */
+    }
+  }
+
+  function historyForZone(hass, st) {
+    if (!hass || !st) return null;
+    const station = st.attributes?.station;
+    if (station != null && station !== "") {
+      const hit = entityState(hass, `sensor.zone_${station}_zone_history`);
+      if (hit) return hit;
+    }
+    const device = st.attributes?.device_id;
+    const zoneName = String(st.attributes?.zone_name || "").trim().toLowerCase();
+    if (!device || !zoneName) return null;
+    return (
+      Object.values(hass.states).find((s) => {
+        if (!s?.entity_id?.startsWith("sensor.") || !/history/i.test(s.entity_id)) return false;
+        if (s.attributes?.device_id !== device) return false;
+        return String(s.attributes?.friendly_name || "").toLowerCase().includes(zoneName);
+      }) || null
+    );
+  }
+
+  function programRunMs(st, program) {
+    const key = String(program || "").toLowerCase();
+    if (!key || key === "manual") return null;
+    const plan = st?.attributes?.[`program_${key}`];
+    const list = plan?.run_times;
+    const hit = Array.isArray(list) ? list.find((row) => Number(row?.run_time) > 0) : null;
+    const minutes = Number(hit?.run_time);
+    return Number.isFinite(minutes) && minutes > 0 ? minutes * 60000 : null;
+  }
+
   function formatClock(seconds) {
     if (seconds == null || !Number.isFinite(seconds)) return "—";
     const s = Math.max(0, Math.round(seconds));
@@ -386,6 +456,10 @@
       this._wasOn = {};
       this._owned = {};
       this._done = {};
+      this._cycle = null;
+      this._cycleReady = false;
+      this._cycleFloor = 0;
+      this._ignoreOffUntil = 0;
       this._stopping = {};
       this._uid = `sp${Math.random().toString(36).slice(2, 8)}`;
     }
@@ -486,21 +560,134 @@
 
     _needsClock() {
       const zones = this._zoneModels();
-      return zones.some((z) => z.active || this._owned[z.entity]) || Boolean(this._queue?.length);
+      const cycleFresh = this._cycle && Date.now() - this._cycle.lastOn <= CYCLE_GAP_MS;
+      return zones.some((z) => z.active || this._owned[z.entity]) || Boolean(this._queue?.length) || Boolean(cycleFresh);
+    }
+
+    _cycleIds() {
+      return normalizeZones(this.config).map((z) => z.entity).join("|");
+    }
+
+    _loadCycle() {
+      if (this._cycleReady || !this.config) return;
+      this._cycleReady = true;
+      this._cycle = loadCycle(this._cycleIds());
+      if (!this._cycle) return;
+      const done = {};
+      for (const id of this._cycle.done) done[id] = true;
+      this._done = done;
+    }
+
+    _saveCycle() {
+      if (!this._cycle || !this.config) return;
+      saveCycle(this._cycleIds(), this._cycle);
+    }
+
+    _clearCycle() {
+      this._cycle = null;
+      this._done = {};
+      if (this.config) clearCycleStore(this._cycleIds());
+    }
+
+    _markDone(entity) {
+      if (!entity || Date.now() < (this._ignoreOffUntil || 0)) return;
+      if (!this._cycle) {
+        this._cycle = {
+          started: Date.now(),
+          lastOn: Date.now(),
+          floor: this._cycleFloor || 0,
+          program: "",
+          done: [],
+          seen: [],
+        };
+      }
+      if (!this._cycle.done.includes(entity)) this._cycle.done.push(entity);
+      this._cycle.seen = (this._cycle.seen || []).filter((id) => id !== entity);
+      this._cycle.lastOn = Date.now();
+      if (!this._done[entity]) this._done = { ...this._done, [entity]: true };
+      this._saveCycle();
+    }
+
+    _applyCloseChain(onStates) {
+      if (!this._cycle || !onStates.length) return;
+      const active = onStates.slice().sort((a, b) => (deviceStartedMs(b) || 0) - (deviceStartedMs(a) || 0))[0];
+      const currentStart = deviceStartedMs(active) || changedMs(active);
+      if (!currentStart) return;
+      const program = String(this._cycle.program || active?.attributes?.current_program || "").toLowerCase();
+      const floor = Number(this._cycle.floor) || 0;
+      const specs = normalizeZones(this.config);
+      const rows = [];
+      for (const spec of specs) {
+        const st = entityState(this.hass, spec.entity);
+        if (!st || isOn(st)) continue;
+        const closedAt = changedMs(st);
+        if (!closedAt) continue;
+        const runMs = programRunMs(st, program) || (Number(spec.durationMin) || 15) * 60000;
+        rows.push({ entity: spec.entity, closedAt, runMs });
+      }
+      rows.sort((a, b) => b.closedAt - a.closedAt);
+      let cursor = currentStart;
+      let gapLimit = 5 * 60000;
+      for (const row of rows) {
+        if (floor && row.closedAt < floor - 15000) break;
+        const gap = cursor - row.closedAt;
+        if (gap < -90000) continue;
+        if (gap > gapLimit) break;
+        this._markDone(row.entity);
+        cursor = row.closedAt;
+        gapLimit = row.runMs + 5 * 60000;
+      }
+    }
+
+    _applyHistoryDone(onStates) {
+      if (!this._cycle || !onStates.length) return;
+      const currentStart = onStates.reduce((min, st) => {
+        const t = deviceStartedMs(st);
+        return Number.isFinite(t) ? Math.min(min, t) : min;
+      }, Date.now());
+      const specs = normalizeZones(this.config);
+      const lookback = specs.reduce((sum, spec) => sum + (Number(spec.durationMin) || 15), 0) * 60000 + 180000;
+      const floor = Number(this._cycle.floor) || 0;
+      const windowStart = Math.max(currentStart - lookback, floor ? floor - 15000 : 0);
+      const program = String(this._cycle.program || "").toLowerCase();
+      const events = [];
+      for (const spec of specs) {
+        const st = entityState(this.hass, spec.entity);
+        if (!st || isOn(st)) continue;
+        const hist = historyForZone(this.hass, st);
+        const started = Date.parse(hist?.attributes?.start_time || "");
+        if (!Number.isFinite(started) || started < windowStart || started > currentStart + 20000) continue;
+        const hp = String(hist?.attributes?.program || "").toLowerCase();
+        if (program && hp && hp !== program) continue;
+        const runMin = Number(hist?.attributes?.run_time);
+        const end = started + (Number.isFinite(runMin) && runMin > 0 ? runMin * 60000 : 0);
+        events.push({ entity: spec.entity, start: started, end });
+      }
+      events.sort((a, b) => a.start - b.start);
+      let cursor = currentStart;
+      for (let i = events.length - 1; i >= 0; i -= 1) {
+        const ev = events[i];
+        if (cursor - ev.end > CYCLE_GAP_MS && cursor - ev.start > CYCLE_GAP_MS) break;
+        this._markDone(ev.entity);
+        cursor = ev.start;
+      }
     }
 
     _syncRunClocks() {
       if (!this.hass || !this.config) return;
+      this._loadCycle();
       const specs = normalizeZones(this.config);
+      const now = Date.now();
       for (const spec of specs) {
         const st = entityState(this.hass, spec.entity);
         if (isOn(st)) {
           this._wasOn[spec.entity] = true;
           if (!this._seenOn[spec.entity]) {
-            this._seenOn[spec.entity] = this._owned[spec.entity] || changedMs(st) || Date.now();
+            this._seenOn[spec.entity] = this._owned[spec.entity] || changedMs(st) || now;
           }
           if (this._queue?.[0]?.entity === spec.entity) this._queueSawOn[spec.entity] = true;
         } else if (this._wasOn[spec.entity]) {
+          this._markDone(spec.entity);
           delete this._wasOn[spec.entity];
           delete this._seenOn[spec.entity];
           delete this._owned[spec.entity];
@@ -509,6 +696,45 @@
           delete this._runFor[spec.entity];
           clearRun(spec.entity);
         }
+      }
+      const onStates = specs.map((spec) => entityState(this.hass, spec.entity)).filter((st) => isOn(st));
+      if (onStates.length) {
+        const program = String(onStates.map((st) => st.attributes?.current_program).find(Boolean) || "");
+        const continuing =
+          this._cycle &&
+          now - this._cycle.lastOn <= CYCLE_GAP_MS &&
+          (!program || !this._cycle.program || program === this._cycle.program);
+        if (!continuing && now >= (this._ignoreOffUntil || 0)) {
+          this._cycle = {
+            started: now,
+            lastOn: now,
+            floor: this._cycleFloor || 0,
+            program,
+            done: [],
+            seen: [],
+          };
+          this._done = {};
+        }
+        if (this._cycle) {
+          this._cycle.lastOn = now;
+          if (program) this._cycle.program = program;
+          for (const st of onStates) {
+            if (st.entity_id && !this._cycle.seen.includes(st.entity_id)) this._cycle.seen.push(st.entity_id);
+          }
+          const keep = [];
+          for (const id of this._cycle.seen) {
+            if (isOn(entityState(this.hass, id))) keep.push(id);
+            else this._markDone(id);
+          }
+          this._cycle.seen = keep;
+          if (now >= (this._ignoreOffUntil || 0)) {
+            this._applyCloseChain(onStates);
+            this._applyHistoryDone(onStates);
+          }
+          this._saveCycle();
+        }
+      } else if (this._cycle && !this._queue?.length && now - this._cycle.lastOn > CYCLE_GAP_MS) {
+        this._clearCycle();
       }
       if (this._queue?.length && !this._advancing) {
         queueMicrotask(() => this._maybeAdvanceQueue());
@@ -789,7 +1015,16 @@
         }
         this._queueStartedAt = Date.now();
         delete this._queueSawOn[head.entity];
-        delete this._done[head.entity];
+        if (this._done[head.entity]) {
+          const nextDone = { ...this._done };
+          delete nextDone[head.entity];
+          this._done = nextDone;
+        }
+        if (this._cycle) {
+          this._cycle.done = (this._cycle.done || []).filter((id) => id !== head.entity);
+          this._cycle.seen = (this._cycle.seen || []).filter((id) => id !== head.entity);
+          this._saveCycle();
+        }
         try {
           await this._startZone(zone, head.minutes);
           return;
@@ -808,7 +1043,9 @@
       if (!items.length || this._advancing) return;
       this._advancing = true;
       this._error = "";
-      this._done = {};
+      this._cycleFloor = Date.now();
+      this._ignoreOffUntil = this._cycleFloor + 8000;
+      this._clearCycle();
       this._queue = items.slice();
       this._queueSawOn = {};
       try {
@@ -956,13 +1193,15 @@
       this._queue = [];
       this._queueSawOn = {};
       this._error = "";
+      this._cycleFloor = 0;
+      this._ignoreOffUntil = Date.now() + 8000;
+      this._clearCycle();
       try {
         for (const zone of this._zoneModels()) {
           if (zone.on || this._owned[zone.entity] || this._bhyveRun[zone.entity]) {
             await this._stopZone(zone);
           }
         }
-        this._done = {};
       } catch {
         this._error = "Could not stop the zones.";
       } finally {
@@ -1008,6 +1247,9 @@
     async _startProgram(entity) {
       if (this._model().anyActive || this._queue?.length) return;
       this._error = "";
+      this._cycleFloor = Date.now();
+      this._ignoreOffUntil = this._cycleFloor + 8000;
+      this._clearCycle();
       try {
         if (this._hasService("bhyve", "start_program")) {
           await this.hass.callService("bhyve", "start_program", { entity_id: entity });
@@ -1039,7 +1281,7 @@
         if (zone.unavailable && !zone.active) {
           body = `<path d="${donutD(CX, CY, R0, R1, a0, a1)}" fill="${idle}" opacity="0.35"/>`;
         } else if (zone.done) {
-          body = `<path d="${donutD(CX, CY, R0, R1, a0, a1)}" fill="#1d6ea3"/>`;
+          body = `<path d="${donutD(CX, CY, R0, R1, a0, a1)}" fill="url(#${uid}-run)"/>`;
         } else if (zone.active) {
           const mid = a0 + slice.span * zone.progress;
           const elapsed = zone.progress > 0.012 ? donutD(CX, CY, R0, R1, a0, mid) : "";
@@ -1059,6 +1301,14 @@
           ? `<path d="${arcD(CX, CY, R1 + 2, a0, a1)}" fill="none" stroke="#ffffff" stroke-width="2.5"/>`
           : "";
         parts.push(`<g data-zone="${i}" class="slice">${body}${selected}</g>`);
+      });
+      model.zones.forEach((zone, i) => {
+        if (!zone.done) return;
+        const slice = model.slices[i];
+        if (!slice) return;
+        parts.push(
+          `<path d="${arcD(CX, CY, TRACK, slice.start, slice.start + slice.span)}" fill="none" stroke="#3cb0ff" stroke-width="8"/>`
+        );
       });
       const active = model.running;
       if (active) {
