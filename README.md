@@ -12,6 +12,10 @@ Works with zone **switches**, **valves**, or toggles. Optional rain-delay switch
 
 <img width="490" height="583" alt="image" src="https://github.com/user-attachments/assets/4c04b0ff-762f-4aa7-b0f4-c52feba7ca5a" />
 
+<img width="499" height="474" alt="image" src="https://github.com/user-attachments/assets/cf6dcb4a-247c-44de-85ae-a90baa0e076a" />
+
+
+
 ![Sprinkler card folded](media/collapsed.png)
 
 ![Sprinkler card while zone 7 is running](media/running.png)
